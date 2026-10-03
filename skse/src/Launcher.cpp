@@ -39,6 +39,30 @@ namespace skycraft::Launcher
 			return n > 0 && n <= std::size(buf) ? std::wstring(buf) : a_path;
 		}
 
+		// ---- Linux bridge (additive; auto-start below is untouched) ---------------------
+		// Same PC, Skyrim via Proton/Wine + native Linux Minecraft (see Link.cpp): this
+		// Win32 auto-start can't launch a native Linux Prism, and the mutex/process scans
+		// can't see host processes, so bridge mode is manual-start (like bStartWithSkyrim
+		// = 0). Mirrors Link.cpp's opt-in: SKYCRAFT_LINUX_BRIDGE=1 (or a path), or
+		// SKYCRAFT_LINK_FILE (the same env the Java side reads) set.
+		bool LinuxBridgeActive()
+		{
+			const auto get = [](const wchar_t* a_name) {
+				const DWORD need = ::GetEnvironmentVariableW(a_name, nullptr, 0);
+				if (need == 0) {
+					return std::wstring{};
+				}
+				std::wstring out(need - 1, L'\0');
+				::GetEnvironmentVariableW(a_name, out.data(), need);
+				return out;
+			};
+			const auto bridge = get(L"SKYCRAFT_LINUX_BRIDGE");
+			if (!bridge.empty() && bridge != L"0") {
+				return true;
+			}
+			return !get(L"SKYCRAFT_LINK_FILE").empty();
+		}
+
 		// Runs a program the way double-clicking it would: started by the desktop's Explorer, not by
 		// Skyrim. Under Mod Organizer that keeps Minecraft out of MO2's virtual file system and off
 		// the list of processes MO2 waits for (it stays locked until they've all exited).
@@ -257,6 +281,13 @@ namespace skycraft::Launcher
 
 	void StartMinecraft()
 	{
+		// Linux bridge: never auto-start from Wine (see above); the player starts the native
+		// Linux Prism/Minecraft themselves. Status stays kOff, like bStartWithSkyrim = 0, so
+		// the corner diagnostics stay silent instead of reporting Windows-only checks.
+		if (LinuxBridgeActive()) {
+			logger::info("Minecraft: Linux bridge active: start the native Linux Minecraft yourself; auto-start disabled");
+			return;
+		}
 		CSimpleIniA ini;
 		ini.SetUnicode();
 		const bool haveIni = ini.LoadFile("Data/SKSE/Plugins/SkyCraft.ini") >= 0;

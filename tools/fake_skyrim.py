@@ -16,6 +16,10 @@ import zlib
 MAGIC = 0x43594B53
 VERSION = 11
 NAME = os.environ.get("SKYCRAFT_LINK", "Local\\SkyCraft_v1")  # fake_guest.py runs one beside a real Skyrim
+# Linux bridge: same layout in a file both the native Minecraft and Skyrim-under-Proton can mmap.
+# Overridden with SKYCRAFT_LINK_FILE=<path>. Windows builds ignore this (named mapping above).
+LINK_FILE = os.environ.get("SKYCRAFT_LINK_FILE", "/dev/shm/skycraft_v1")
+IS_WINDOWS = os.name == "nt"
 OFF_SKY = 0x100
 OFF_MC = 0x200
 OFF_OVL = 0x300
@@ -39,6 +43,9 @@ X0 = 100000    # test area origin (blocks); must be a multiple of 8
 
 
 def tick():
+    if not IS_WINDOWS:
+        # GetTickCount64() is millis since boot (CLOCK_MONOTONIC); same clock Wine uses.
+        return int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000)
     import ctypes
 
     return ctypes.windll.kernel32.GetTickCount64()
@@ -46,6 +53,9 @@ def tick():
 
 class Link:
     def __init__(self):
+        if not IS_WINDOWS:
+            self._open_file_mapping()
+            return
         import ctypes
 
         ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_uint64
@@ -67,6 +77,33 @@ class Link:
         self.events = []
         self.sections = 0
         self.atlas = None
+
+    def _open_file_mapping(self):
+        # Linux bridge backend: byte-identical layout in a file. Windows named mapping untouched.
+        parent = os.path.dirname(os.path.abspath(LINK_FILE))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        self._file = open(LINK_FILE, "w+b")
+        self._file.truncate(SIZE)
+        self.m = mmap.mmap(self._file.fileno(), SIZE, access=mmap.ACCESS_WRITE)
+        self.m[0:0x100] = bytes(0x100)
+        self.m[OFF_SKY:OFF_SKY + 0x40] = bytes(0x40)
+        self.m[OFF_OVL:OFF_OVL + 0x100] = bytes(0x100)
+        self.m[OFF_IN:OFF_IN + 0x80] = bytes(0x80)
+        self.m[OFF_COL:OFF_COL + 0x80] = bytes(0x80)
+        self.m[OFF_ACTORS:OFF_ACTORS + 0x40] = bytes(0x40)
+        self.m[OFF_EVENTS:OFF_EVENTS + 0x80] = bytes(0x80)
+        self.m[OFF_ENTITIES:OFF_ENTITIES + 0x40] = bytes(0x40)
+        self.m[OFF_RENDER:OFF_RENDER + 0x80] = bytes(0x80)
+        struct.pack_into("<IIII", self.m, 0, MAGIC, VERSION, os.getpid(), 0)
+        self.front = 2
+        self.sky_seq = 0
+        self.col_head = 0
+        self.actor_seq = 0
+        self.events = []
+        self.sections = 0
+        self.atlas = None
+        print(f"fake Skyrim (linux file mapping): {LINK_FILE} ({SIZE >> 20} MB)")
 
     def heartbeat(self):
         struct.pack_into("<Q", self.m, 0x10, tick())

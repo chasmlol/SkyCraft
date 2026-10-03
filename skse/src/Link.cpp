@@ -2,6 +2,8 @@
 
 #include <sddl.h>
 
+#include <filesystem>
+
 namespace skycraft
 {
 	namespace
@@ -56,6 +58,70 @@ namespace skycraft
 			}
 			return descriptor;
 		}
+
+		// ---- Linux bridge (additive; Windows default path below is untouched) -----------------
+		// Same PC, Skyrim via Proton/Wine + native Linux Minecraft. The plugin still builds as a
+		// Windows DLL; in bridge mode the mapping is a real file both sides mmap instead of the
+		// Win32 Local\ namespace (which a native Linux process can't open).
+		// The Java side defaults to /dev/shm/skycraft_v1 (Proto.LINUX_SHM_PATH); under Wine that
+		// file is visible as Z:\dev\shm\skycraft_v1 (Z: maps to /).
+		inline constexpr wchar_t kLinuxDefaultWinePath[] = L"Z:\\dev\\shm\\skycraft_v1";
+
+		std::wstring GetEnvWide(const wchar_t* a_name)
+		{
+			const DWORD need = ::GetEnvironmentVariableW(a_name, nullptr, 0);
+			if (need == 0) {
+				return {};
+			}
+			std::wstring out(need - 1, L'\0');
+			::GetEnvironmentVariableW(a_name, out.data(), need);
+			return out;
+		}
+
+		// A Unix-absolute path (/dev/shm/x) becomes the Wine-visible Z: path (Z:\dev\shm\x) so the
+		// same SKYCRAFT_LINK_FILE value works on both sides. Anything else is used as-is.
+		std::wstring LinuxPathToWine(std::wstring a_path)
+		{
+			if (a_path.empty() || a_path[0] != L'/') {
+				return a_path;
+			}
+			for (auto& c : a_path) {
+				if (c == L'/') {
+					c = L'\\';
+				}
+			}
+			return L"Z:" + a_path;
+		}
+
+		// Returns the backing file when Linux-bridge mode is on, or empty for default Windows mode.
+		// SKYCRAFT_LINUX_BRIDGE=1 (or true): the default file. Any other non-"0" value: that path.
+		// SKYCRAFT_LINK_FILE (same env the Java side reads) is honored as a fallback.
+		std::wstring LinuxBridgePath()
+		{
+			auto bridge = GetEnvWide(L"SKYCRAFT_LINUX_BRIDGE");
+			if (!bridge.empty() && bridge != L"0") {
+				if (bridge == L"1" || _wcsicmp(bridge.c_str(), L"true") == 0) {
+					return kLinuxDefaultWinePath;
+				}
+				return LinuxPathToWine(bridge);
+			}
+			auto linkFile = GetEnvWide(L"SKYCRAFT_LINK_FILE");
+			if (!linkFile.empty()) {
+				return LinuxPathToWine(linkFile);
+			}
+			return {};
+		}
+
+		std::string Narrow(const std::wstring& a_wide)
+		{
+			if (a_wide.empty()) {
+				return {};
+			}
+			const int need = ::WideCharToMultiByte(CP_UTF8, 0, a_wide.data(), static_cast<int>(a_wide.size()), nullptr, 0, nullptr, nullptr);
+			std::string out(static_cast<std::size_t>(std::max(need, 0)), '\0');
+			::WideCharToMultiByte(CP_UTF8, 0, a_wide.data(), static_cast<int>(a_wide.size()), out.data(), need, nullptr, nullptr);
+			return out;
+		}
 	}
 
 	Link& Link::Get()
@@ -72,6 +138,63 @@ namespace skycraft
 		const auto size = proto::kMappingBytes;
 		if (Elevated()) {
 			logger::info("Skyrim is running as administrator");
+		}
+		// Linux bridge: file-backed mapping so a native Linux Minecraft can open the same bytes
+		// (Windows pagefile-backed Local\ mapping is invisible outside Wine). Opt-in only.
+		if (const auto bridgePath = LinuxBridgePath(); !bridgePath.empty()) {
+			std::error_code ec;
+			std::filesystem::create_directories(std::filesystem::path(bridgePath).parent_path(), ec);
+			HANDLE file = ::CreateFileW(bridgePath.c_str(), GENERIC_READ | GENERIC_WRITE,
+				FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (file == INVALID_HANDLE_VALUE) {
+				logger::error("CreateFileW failed for Linux bridge file ({})", ::GetLastError());
+				return false;
+			}
+			LARGE_INTEGER fileSize{};
+			bool          existed = false;
+			if (::GetFileSizeEx(file, &fileSize) && fileSize.QuadPart == static_cast<LONGLONG>(size)) {
+				existed = true;
+			}
+			LARGE_INTEGER want{};
+			want.QuadPart = static_cast<LONGLONG>(size);
+			if (!::SetFilePointerEx(file, want, nullptr, FILE_BEGIN) || !::SetEndOfFile(file)) {
+				logger::error("couldn't size Linux bridge file ({})", ::GetLastError());
+				::CloseHandle(file);
+				return false;
+			}
+			mapping_ = ::CreateFileMappingW(file, nullptr, PAGE_READWRITE, static_cast<DWORD>(size >> 32),
+				static_cast<DWORD>(size & 0xFFFFFFFF), nullptr);
+			const DWORD created = ::GetLastError();
+			::CloseHandle(file);
+			if (!mapping_) {
+				logger::error("CreateFileMapping failed for Linux bridge file ({})", created);
+				return false;
+			}
+			base_ = static_cast<std::uint8_t*>(::MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+			if (!base_) {
+				logger::error("MapViewOfFile failed ({})", ::GetLastError());
+				::CloseHandle(mapping_);
+				mapping_ = nullptr;
+				return false;
+			}
+
+			// Same reset as the Windows path: rings and swap start from a known state.
+			auto* header = At<proto::Header>(proto::kOffHeader);
+			std::memset(base_ + proto::kOffSkyState, 0, sizeof(proto::SkyState));
+			std::memset(base_ + proto::kOffOverlayCtl, 0, 0x100);
+			std::memset(base_ + proto::kOffInputRing, 0, proto::kInputRingDataOff);
+			std::memset(base_ + proto::kOffCollisionRing, 0, proto::kColRingDataOff);
+			std::memset(base_ + proto::kOffActorTable, 0, sizeof(proto::ActorTable));
+			std::memset(base_ + proto::kOffEventRing, 0, proto::kEventRingDataOff);
+			std::memset(base_ + proto::kOffWorldEntities, 0, sizeof(proto::WorldEntities));
+			std::memset(base_ + proto::kOffRenderRing, 0, proto::kRenRingDataOff);
+			header->version = proto::kVersion;
+			header->skyrimPid = ::GetCurrentProcessId();
+			header->skyrimHeartbeatMs = ::GetTickCount64();
+			Atomic(header->magic).store(proto::kMagic, std::memory_order_release);
+
+			logger::info("shared memory {} ({} MB, {}) [linux bridge]", Narrow(bridgePath), size >> 20, existed ? "reused" : "created");
+			return true;
 		}
 		SECURITY_ATTRIBUTES access{ sizeof(access), SharedWithThisUser(), FALSE };
 		mapping_ = ::CreateFileMappingW(INVALID_HANDLE_VALUE, access.lpSecurityDescriptor ? &access : nullptr, PAGE_READWRITE,
