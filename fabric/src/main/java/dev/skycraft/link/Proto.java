@@ -12,6 +12,12 @@ public final class Proto {
 	// A second client on the same PC (multiplayer testing) talks to its own stand-in Skyrim:
 	// -Dskycraft.link=Local\SkyCraft_guest (see tools/fake_guest.py).
 	public static final String MAPPING_NAME = System.getProperty("skycraft.link", "Local\\SkyCraft_v1");
+	// Linux bridge (same PC: Skyrim via Proton + native Linux Minecraft): a file both sides mmap.
+	// Overridden with -Dskycraft.linkFile=<path> or SKYCRAFT_LINK_FILE=<path>.
+	// The SKSE plugin opens the same file as Z:\dev\shm\skycraft_v1 (or the configured path).
+	// Windows builds ignore this; the Win32 Local\ mapping above stays the default there.
+	public static final String LINUX_SHM_PATH = System.getProperty("skycraft.linkFile",
+		System.getenv().getOrDefault("SKYCRAFT_LINK_FILE", "/dev/shm/skycraft_v1"));
 	public static final double UNITS_PER_BLOCK = 70.0;
 
 	public static final long OFF_HEADER = 0x0;
